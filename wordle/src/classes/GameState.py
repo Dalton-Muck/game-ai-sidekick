@@ -2,6 +2,7 @@ import os
 import random
 import re
 import threading
+import time
 import requests
 from enum import Enum
 from threading import Timer
@@ -110,6 +111,8 @@ class GameState:
                 self.api_key_valid = False
 
         self.gemini_client: genai.Client | None = None
+        self.last_gemini_call_time: float = 0  # Track last Gemini API call time
+        self.gemini_min_delay: float = 30.0  # Minimum 30 seconds between calls
         if self.llm_platform == "gemini":
             try:
                 self.gemini_client = genai.Client(
@@ -289,6 +292,26 @@ class GameState:
         self.ai_loading = True
 
         try:
+            # For guesses 1-4, use the required starting words directly without LLM
+            guess_number = self.num_of_tries() + 1
+            starting_words = ["FAKES", "GLORY", "CHIMP", "BUNDT"]
+            
+            if guess_number <= 4:
+                word_to_use = starting_words[guess_number - 1]
+                print(word_to_use)
+                self.total_llm_guesses.append({
+                    "guess": word_to_use,
+                    "retries": 0,
+                    "accepted": None,
+                    "previous_guesses": [
+                        word.guessed_word for word in self.words if word.locked
+                    ],
+                    "step": guess_number,
+                })
+                self.enter_word_from_solver(word_to_use, check=(not self.show_window))
+                self.ai_loading = False
+                return
+
             messages = messages or generate_messages(
                 [word.guessed_word for word in self.words if word.locked],
                 [word.get_feedback()
@@ -307,6 +330,16 @@ class GameState:
                 if not self.gemini_client:
                     return
 
+                # Enforce 30-second delay between Gemini API calls (only on initial call, not retries)
+                if calls == 0:
+                    current_time = time.time()
+                    time_since_last_call = current_time - self.last_gemini_call_time
+                    if time_since_last_call < self.gemini_min_delay:
+                        wait_time = self.gemini_min_delay - time_since_last_call
+                        print(f"Waiting {wait_time:.1f} seconds before next Gemini API call...")
+                        time.sleep(wait_time)
+                    self.last_gemini_call_time = time.time()  # Update last call time
+                
                 contents = "\n".join(map(
                     lambda message: message["content"], messages))
                 completion = self.gemini_client.models.generate_content(
@@ -428,13 +461,38 @@ class GameState:
                     f.write("{" + org_response + "}" + "\n")
                     f.close()
 
+            # Clean up response and extract word
             response = org_response.replace("Guess: ", "").replace(
-                "My first guess is: ", "").replace("Okay, let's begin!", "")
-            response = re.search(r'\b\w{5}\b', response)
-            if response:
-                completion_message = response.group(0)
+                "My first guess is: ", "").replace("Okay, let's begin!", "").strip()
+            
+            # Try to find word on first line (new format)
+            lines = response.split('\n')
+            first_line = lines[0].strip().upper() if lines else ""
+            
+            # Remove any leading/trailing punctuation or spaces
+            first_line = re.sub(r'^[^A-Z]*', '', first_line)
+            first_line = re.sub(r'[^A-Z]*$', '', first_line)
+            
+            completion_message = ""
+            
+            # Check if first line is exactly a 5-letter word
+            if len(first_line) == WORD_LENGTH and first_line.isalpha():
+                completion_message = first_line
             else:
-                completion_message = ""
+                # Try to extract 5-letter word from first line
+                word_match = re.search(r'\b([A-Z]{5})\b', first_line)
+                if word_match:
+                    completion_message = word_match.group(1)
+                else:
+                    # Fallback: search entire response for 5-letter word
+                    word_match = re.search(r'\b([A-Z]{5})\b', response.upper())
+                    if word_match:
+                        completion_message = word_match.group(1)
+                    else:
+                        # Last resort: try to find any 5-letter sequence
+                        word_match = re.search(r'([A-Z]{5})', response.upper())
+                        if word_match:
+                            completion_message = word_match.group(1)
 
             if len(completion_message) == WORD_LENGTH:
                 reasons = self.solver.reason_guess(completion_message)
@@ -458,7 +516,24 @@ class GameState:
                         completion_message, check=(not self.show_window))
             else:
                 self.was_valid_guess = False
-                print("Error: AI did not return a valid guess")
+                print(f"Error: AI did not return a valid guess. Response was: {org_response[:100]}")
+                # If we've retried too many times, use solver as fallback
+                if calls < MAX_LLM_CONTINUOUS_CALLS:
+                    # Retry with a clearer prompt
+                    retry_message = {
+                        "role": "user",
+                        "content": f"ERROR: Your previous response '{org_response[:50]}' did not contain a valid 5-letter word. Please respond with ONLY a 5-letter word in UPPERCASE on the first line."
+                    }
+                    messages.append(retry_message)
+                    self.enter_word_from_ai(messages, calls + 1)
+                else:
+                    # Final fallback: use solver to suggest a word
+                    try:
+                        solver_word = self.solver.get_guess()
+                        print(f"Using solver fallback: {solver_word}")
+                        self.enter_word_from_solver(solver_word, check=(not self.show_window))
+                    except:
+                        print("Solver also failed, game may be stuck")
 
         except Exception as e:
             self.error_message = str(e)
@@ -491,6 +566,8 @@ class GameState:
                 self.gemini_client = genai.Client(
                     api_key=os.getenv("GEMINI_API_KEY", default="")
                 )
+                self.last_gemini_call_time = 0  # Initialize delay tracking
+                self.gemini_min_delay = 30.0  # 30 seconds between calls
                 self.api_key_valid = True
             elif llm == "grok":
                 self.grok_key = os.getenv("GROK_API_KEY", "")
